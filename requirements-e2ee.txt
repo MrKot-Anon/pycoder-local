@@ -1,0 +1,7 @@
+# Optional native dependencies: install into the Python environment running PyCoder.
+# pqcrypto 1.x removed the API used by chutes-e2ee 0.1.0.
+chutes-e2ee==0.1.0
+pqcrypto==0.3.4
+cryptography==43.0.1
+dcap-qvl==0.6.5
+nv-attestation-sdk==2.7.3

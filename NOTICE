@@ -1,0 +1,42 @@
+PyCoder
+
+This project includes Python adaptations of algorithms and prompts from:
+OpenAI Codex
+Copyright 2025 OpenAI
+Apache License, Version 2.0
+Source revision: 18344a972d (local ../codex checkout)
+
+Adapted files and algorithms:
+- pycoder/agent.py, pycoder/history.py: core/src/session/turn.rs,
+  core/src/compact.rs, core/src/session/mod.rs
+- pycoder/patch.py: apply-patch/src/parser.rs, seek_sequence.rs, file_update.rs
+- pycoder/prompts.py, pycoder/instructions/: models-manager/prompt.md,
+  core/assets/tools/apply_patch.lark, core/src/tools/handlers/*_spec.rs,
+  prompts/templates/compact/prompt.md, prompts/templates/compact/summary_prefix.md
+- pycoder/util.py: byte-based token estimation and middle truncation concepts
+- pycoder/tools.py: interfaces/semantics adapted from core/src/tools/handlers/
+  request_user_input, shell, current_time, sleep, new_context_window, view_image
+- pycoder/permissions.py: project-scoped approvals inspired by tools/orchestrator;
+  exact command rules are a simplified implementation, not Codex execpolicy
+- tests/fixtures: apply-patch/tests/fixtures/scenarios (selected scenarios)
+- pycoder/tui.py, pycoder/tool_output.py: command display behavior inspired by
+  tui/src/exec_cell/render.rs and live_output.rs (five-row previews, live tail,
+  separate transcript); implemented independently with Textual and disk paging
+- pycoder/team.py: local adaptation of lifecycle/mailbox concepts in
+  core/src/tools/handlers/multi_agents_v2; one-level thread-based team, same provider
+- pycoder/scheduler.py: parallel-safe tool dispatch with sequential mutation
+  barriers, inspired by the Codex tool router
+- pycoder/instructions/seatbelt*.sbpl: sandboxing/src/seatbelt_base_policy.sbpl
+  and seatbelt_network_policy.sbpl, copied from the above revision. The generated
+  policy and Python Bubblewrap/proxy/seccomp integration are project adaptations.
+
+These files have been modified or translated for this standalone Python project.
+No Ratatui code or other third-party runtime code from Codex is incorporated.
+The standalone distribution separately includes Textual and its Python dependencies.
+Their licenses and package metadata are included in their *.dist-info directories.
+The original repository and its full NOTICE are available in ../codex.
+
+This software is not an official OpenAI or Chutes product. It does not require
+the Codex executable, OpenAI SDK, an OpenAI account, or OpenAI services.
+
+Detailed instruction provenance and runtime adaptations: pycoder/instructions/SOURCES.md.

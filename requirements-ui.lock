@@ -1,0 +1,10 @@
+# Pure Python runtime dependencies included in the executable; Python >=3.11.
+textual==8.2.8
+rich==15.0.0
+pygments==2.21.0
+markdown-it-py==4.2.0
+mdit-py-plugins==0.6.1
+mdurl==0.1.2
+linkify-it-py==2.2.0
+platformdirs==4.12.0
+typing-extensions==4.16.0
