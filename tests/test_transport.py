@@ -110,6 +110,35 @@ class TransportTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ModelError):
                 Client._validate(Client._message(raw), "tool_calls")
 
+    def test_tool_calls_finish_requires_a_call_in_stream_and_json(self):
+        for stream in (True, False):
+            with self.subTest(stream=stream):
+                if stream:
+                    events = [{"choices": [{"delta": {"content": "I will run a command"}}]},
+                              {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}]
+                    response = io.BytesIO("".join("data: " + json.dumps(event) + "\n\n" for event in events).encode())
+                    with self.assertRaisesRegex(ModelError, "tool_calls without tool_calls"):
+                        Client(Config(model="test"), "")._stream(response, lambda _: None)
+                else:
+                    with server(lambda _: json_response(reply("I will run a command", finish="tool_calls"))) as (url, _):
+                        with self.assertRaisesRegex(ModelError, "tool_calls without tool_calls"):
+                            Client(Config(model="test", base_url=url, stream=False, retries=0), "").complete([])
+
+    def test_textual_minimax_call_with_tool_finish_reaches_agent(self):
+        raw = ('<minimax:tool_call><invoke name="read_file">'
+               '<parameter name="path">a.py</parameter></invoke></minimax:tool_call>')
+        for stream in (True, False):
+            with self.subTest(stream=stream):
+                if stream:
+                    events = [{"choices": [{"delta": {"content": raw}}]},
+                              {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}]
+                    response = io.BytesIO("".join("data: " + json.dumps(event) + "\n\n" for event in events).encode())
+                    message = Client(Config(model="test"), "")._stream(response, lambda _: None).message
+                else:
+                    with server(lambda _: json_response(reply(raw, finish="tool_calls"))) as (url, _):
+                        message = Client(Config(model="test", base_url=url, stream=False), "").complete([]).message
+                self.assertEqual(message["content"], raw)
+
     def test_only_configured_endpoint_no_proxy(self):
         with server(lambda r: json_response(reply("Привет"))) as (url, requests):
             with patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1"}):

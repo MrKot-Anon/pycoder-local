@@ -95,7 +95,7 @@ class ExecutionModeTests(unittest.TestCase):
         directory = self.base / "config"
         private_json(directory / "config.json", asdict(self.cfg))
         responses = [json_response(reply(None, [call("exec_command", {"cmd": "printf must-not-run"})])),
-                     json_response(reply("Done"))]
+                     json_response(reply("Done [[PYCODER_DONE]]"))]
         with server(lambda requests: responses[len(requests) - 1]) as (url, requests), \
                 patch("sys.stdin.isatty", return_value=False), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

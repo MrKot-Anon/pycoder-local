@@ -609,6 +609,54 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.2)
                 copy.assert_called_with("Ошибка соединения")
 
+    async def test_copy_selection_from_model_journal(self):
+        runtime = FakeRuntime()
+        app = CoderApp(runtime)
+        with patch("pycoder.tui.write_clipboard", return_value=True) as copy, \
+                patch("pycoder.tui.read_clipboard", return_value=""), \
+                patch("textual.app.App.copy_to_clipboard", autospec=True) as terminal_copy:
+            async with app.run_test(size=(110, 35)) as pilot:
+                await pilot.pause(0.1)
+                app.action_logs()
+                pane = app.query_one("#logs")
+                pane.append_model("content", "ЖУРНАЛ ТЕСТ")
+                pane.refresh_model()
+                await pilot.pause(0.1)
+                widget = pane.query_one("#model-stream-content")
+                x = widget.content_region.x - widget.region.x
+                y = widget.content_region.y - widget.region.y
+                await pilot.mouse_down(widget, offset=(x, y + 2))
+                await pilot.hover(widget, offset=(x + 7, y + 2))
+                await pilot.mouse_up(widget, offset=(x + 7, y + 2))
+                await pilot.pause(0.1)
+                selected = app.selected_text()
+                self.assertTrue(selected)
+                pane.append_model("content", " НОВЫЙ ФРАГМЕНТ")
+                pane.refresh_model()
+                await pilot.pause(0.1)
+                self.assertEqual(app.selected_text(), selected)
+                await pilot.press("ctrl+c")
+                await pilot.pause(0.2)
+                copy.assert_called_with(selected)
+                terminal_copy.assert_any_call(app, selected)
+                await pilot.mouse_down(widget, offset=(x + 2, y + 2), button=3)
+                await pilot.pause(0.2)
+                self.assertIsInstance(app.screen, CopyMenu)
+                self.assertEqual(app.screen.selected, selected)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                copy.assert_called_with(selected)
+
+    async def test_steering_message_leaves_pending_counter_on_delivery(self):
+        runtime = FakeRuntime()
+        app = CoderApp(runtime)
+        async with app.run_test(size=(100, 35)) as pilot:
+            await pilot.pause(0.1)
+            app.pending_count = 2
+            runtime.bus.emit("steering_received", count=1)
+            await pilot.pause(0.1)
+            self.assertEqual(app.pending_count, 1)
+
     async def test_native_paste_shortcut_menu_order_and_copy_never_cancels(self):
         from textual.document._document import Selection
         runtime = FakeRuntime()

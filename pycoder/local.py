@@ -36,6 +36,7 @@ def prepare_local(config, args, emit=print):
         setattr(config, key, getattr(defaults, key))
     config.base_url = local_url(args.local)
     config.require_token = False
+    config.require_explicit_finish = True
     args.no_auth = True  # Do not send even an environment-provided cloud API key.
     config.model = args.model or ""
     config.context_window = args.context_window if args.context_window is not None else defaults.context_window

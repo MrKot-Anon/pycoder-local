@@ -62,6 +62,7 @@ class Config:
     generation_timeout_seconds: int = 600
     retries: int = 3
     stream: bool = True
+    require_explicit_finish: bool = False
     require_token: bool = True
     approval: str = "ask"
     sandbox_enabled: bool = True
@@ -78,6 +79,8 @@ class Config:
         validate(self)
         if type(self.e2ee_verify_attestation) is not bool:
             raise ValueError("e2ee_verify_attestation must be boolean")
+        if type(self.require_explicit_finish) is not bool:
+            raise ValueError("require_explicit_finish must be boolean")
         from .network_policy import host_port
         if (not isinstance(self.e2ee_mrtd, list) or any(
                 not isinstance(value, str) or len(value) != 96

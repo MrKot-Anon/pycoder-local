@@ -39,7 +39,7 @@ class LocalTests(unittest.TestCase):
         def respond(requests):
             if requests[-1]["method"] == "GET":
                 return json_response({"data": [{"id": "minimax-m2.5", "meta": {"n_ctx": 49152}}]})
-            return json_response(reply("LOCAL_OK"))
+            return json_response(reply("LOCAL_OK [[PYCODER_DONE]]"))
         with tempfile.TemporaryDirectory() as d, server(respond) as (url, requests):
             root = Path(d)
             config = root / "config"

@@ -8,12 +8,12 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from pycoder.agent import Agent
+from pycoder.agent import Agent, FINAL_MARKER, recover_text_tool_call
 from pycoder.config import Config
 from pycoder.history import History
 from pycoder.prompts import COMPACT, SUMMARY_PREFIX
 from pycoder.tools import Tools
-from pycoder.transport import Client, Completion, ModelError
+from pycoder.transport import Client, Completion, ModelError, ProtocolError
 from tests.support import call, json_response, reply, server
 
 
@@ -106,6 +106,89 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(len(requests), 2)
             self.assertEqual(requests[1]["body"]["messages"][-1]["role"], "tool")
             self.assertEqual(self.history.messages[-1]["content"], "Работа завершена")
+
+    def test_textual_minimax_call_after_command_result_continues_cycle(self):
+        text_call = ('\n\nПодожду результатов теста:\n\n'
+                     '<invoke name="write_stdin">\n'
+                     '<parameter name="session_id">1</parameter>\n'
+                     '<parameter name="yield_time_ms">300000</parameter>\n'
+                     '</invoke>\n</minimax:tool_call>')
+        client = Mock()
+        client.complete.side_effect = [
+            Completion({"role": "assistant", "content": None,
+                        "tool_calls": [call("exec_command", {"cmd": "python3 -c 'print(1)'"}, "start")]}, {}, "tool_calls"),
+            Completion({"role": "assistant", "content": text_call, "reasoning_content": "Жду результатов."}, {}, "stop"),
+            Completion({"role": "assistant", "content": "Тест завершён."}, {}, "stop")]
+        self.tools.execute = Mock(side_effect=['{"running": true, "session_id": 1}',
+                                               '{"running": false, "exit_code": 0, "output": "PASS"}'])
+        self.assertEqual(self.agent(client).run("Run test and wait for it"), "Тест завершён.")
+        self.assertEqual(client.complete.call_count, 3)
+        self.assertEqual(self.tools.execute.call_args_list[1].args[0], "write_stdin")
+        self.assertEqual(json.loads(self.tools.execute.call_args_list[1].args[1]),
+                         {"session_id": 1, "yield_time_ms": 300000})
+        self.assertEqual(self.history.messages[-3]["tool_calls"][0]["function"]["name"], "write_stdin")
+
+    def test_textual_minimax_call_rejects_malformed_and_ignores_examples(self):
+        example = 'Example: <invoke name="write_stdin"></invoke>'
+        self.assertEqual(recover_text_tool_call({"content": example}), {"content": example})
+        two_calls = ('Checking files. <minimax:tool_call>'
+                     '<invoke name="read_file"><parameter name="path">a.py</parameter></invoke>'
+                     '<invoke name="read_file"><parameter name="path">b.py</parameter></invoke>'
+                     '</minimax:tool_call>')
+        recovered = recover_text_tool_call({"content": two_calls})
+        self.assertEqual(recovered["content"], "Checking files.")
+        self.assertEqual([json.loads(item["function"]["arguments"])["path"]
+                          for item in recovered["tool_calls"]], ["a.py", "b.py"])
+        command = ('<minimax:tool_call><invoke name="exec_command">'
+                   '<parameter name="cmd">printf "a & b" && test 2 < 3</parameter>'
+                   '</invoke></minimax:tool_call>')
+        recovered = recover_text_tool_call({"content": command})
+        self.assertEqual(json.loads(recovered["tool_calls"][0]["function"]["arguments"])["cmd"],
+                         'printf "a & b" && test 2 < 3')
+        loose = recover_text_tool_call({"content": "<invoke name='write_stdin'>"
+                                                  "<parameter name='session_id'>1</invoke>"})
+        self.assertEqual(json.loads(loose["tool_calls"][0]["function"]["arguments"]), {"session_id": 1})
+        with self.assertRaisesRegex(ProtocolError, "incomplete textual Minimax"):
+            recover_text_tool_call({"content": '<invoke name="write_stdin"><parameter name="session_id">1'})
+
+    def test_local_mode_requires_explicit_finish_after_tool_result(self):
+        self.cfg.require_explicit_finish = True
+        client = Mock()
+        client.complete.side_effect = [
+            Completion({"role": "assistant", "content": None,
+                        "tool_calls": [call("list_files", {}, "files")]}, {}, "tool_calls"),
+            Completion({"role": "assistant", "content": "Подожду ещё."}, {}, "stop"),
+            Completion({"role": "assistant", "content": "Проверено. " + FINAL_MARKER}, {}, "stop")]
+        self.assertEqual(self.agent(client).run("Inspect files"), "Проверено.")
+        self.assertEqual(client.complete.call_count, 3)
+        self.assertIn("did not explicitly finish", client.complete.call_args.args[0][-1]["content"])
+
+    def test_local_mode_never_reports_done_without_final_marker(self):
+        self.cfg.require_explicit_finish = True
+        client = Mock()
+        client.complete.return_value = Completion({"role": "assistant", "content": "Подожду ещё."}, {}, "stop")
+        with self.assertRaisesRegex(ModelError, "without an explicit final marker"):
+            self.agent(client).run("Run task")
+        self.assertEqual(client.complete.call_count, 3)
+
+    def test_malformed_textual_minimax_call_is_reissued_without_execution(self):
+        self.cfg.require_explicit_finish = True
+        malformed = '<invoke name="write_stdin"><parameter name="session_id">1'
+        client = Mock()
+        client.complete.side_effect = [Completion({"role": "assistant", "content": malformed}, {}, "stop"),
+                                       Completion({"role": "assistant", "content": FINAL_MARKER}, {}, "stop")]
+        self.tools.execute = Mock()
+        self.assertEqual(self.agent(client).run("Wait for the test"), "")
+        self.tools.execute.assert_not_called()
+        self.assertIn("invalid tool-call syntax", client.complete.call_args.args[0][-1]["content"])
+
+    def test_protocol_error_retries_with_feedback(self):
+        self.cfg.require_explicit_finish = True
+        client = Mock()
+        client.complete.side_effect = [ProtocolError("Invalid model response: malformed call"),
+                                       Completion({"role": "assistant", "content": "Done " + FINAL_MARKER}, {}, "stop")]
+        self.assertEqual(self.agent(client).run("Complete task"), "Done")
+        self.assertIn("malformed call", client.complete.call_args.args[0][-1]["content"])
 
     def test_compaction_preserves_user_constraints_and_journal(self):
         self.history.append({"role": "user", "content": "Do not change public API"})

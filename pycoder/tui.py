@@ -1288,6 +1288,8 @@ class CoderApp(App):
             self.phase = "Работаю…"
             self.response = None
             self.response_text = ""
+        elif kind == "steering_received":
+            self.pending_count = max(0, self.pending_count - data["count"])
         elif kind == "idle":
             if self.retry_bubble is not None:
                 await self.retry_bubble.remove()
@@ -1604,13 +1606,11 @@ class CoderApp(App):
         self.run_worker(paste(), group="clipboard", exit_on_error=False)
 
     def copy_to_clipboard(self, text):
-        self._clipboard = text
+        super().copy_to_clipboard(text)
         async def copy():
             async with self._clipboard_lock:
                 native = await asyncio.to_thread(write_clipboard, text)
-                if not native:
-                    super(CoderApp, self).copy_to_clipboard(text)
-                self.notify("Скопировано" if native else "Отправлено в буфер терминала (OSC 52)")
+                self.notify("Скопировано" if native else "Отправлено через OSC 52; терминал может запретить копирование")
         self.run_worker(copy(), group="clipboard", exit_on_error=False)
 
     @staticmethod

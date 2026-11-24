@@ -24,7 +24,7 @@ HELP = """/help — справка · /compact — сжать контекст �
 /context — бюджет · /plan — план · /session — журнал · /permissions — разрешения
 /settings — лимиты · /processes — процессы · /logs — ошибки · /exit — выход
 Enter — отправить · Ctrl+J — новая строка · Esc — назад · Ctrl+G — прервать работу
-Во время работы новые сообщения попадают в очередь. Tab — команды.
+Во время работы новые сообщения дополняют задачу перед следующим запросом модели. Tab — команды.
 Файлы внутри проекта доверены. macOS/Linux: shell по умолчанию в песочнице,
 её сеть закрыта. В полном доступе сеть открыта. Настройки → Песочница и сеть.
 Windows: прежние подтверждения."""
@@ -35,6 +35,7 @@ class Runtime:
         self.args, self.config, self.root, self.state_dir = args, config, root, state_dir
         self.bus = EventBus()
         self.jobs = Queue()
+        self.steering = Queue()
         self.controls = Queue()
         self.view_state = {}
         self.panel_action = None
@@ -221,8 +222,22 @@ class Runtime:
     def submit(self, text):
         with self._state_lock:
             if not self.stopping.is_set():
-                self.jobs.put((self._generation, text))
+                if self.active and self.agent is not None and isinstance(text, str) and not text.startswith("/"):
+                    self.steering.put(text)
+                else:
+                    self.jobs.put((self._generation, text))
                 self.activity.set()
+
+    def drain_steering(self):
+        messages = []
+        while True:
+            try:
+                messages.append(self.steering.get_nowait())
+            except Empty:
+                break
+        if messages:
+            self.emit("steering_received", count=len(messages))
+        return messages
 
     def cancel(self):
         with self._state_lock:
@@ -235,6 +250,11 @@ class Runtime:
             while True:
                 try:
                     self.jobs.get_nowait()
+                except Empty:
+                    break
+            while True:
+                try:
+                    self.steering.get_nowait()
                 except Empty:
                     break
             if not self.active and not self.stopping.is_set():
@@ -330,6 +350,7 @@ class Runtime:
         self.agent = Agent(cfg, self.client, self.history, self.tools, self.status,
                            lambda text: self.emit("text", text=self.safe(text)), self.emit, self.bus.cancelled)
         self.agent.on_checkpoint = self.apply_controls
+        self.agent.incoming = self.agent.before_finish = self.drain_steering
         from .team import Team
         self.team = Team(self.agent, self.state_dir, emit=self.emit, request=self.bus.request,
                          on_usage=self.record_usage, diagnostic=self.report_error)
@@ -434,6 +455,13 @@ class Runtime:
                     self.tools.compaction_requested = False
                     with self._state_lock:
                         self.active = False
+                        while True:
+                            try:
+                                pending = self.steering.get_nowait()
+                            except Empty:
+                                break
+                            if not self.stopping.is_set():
+                                self.jobs.put((self._generation, pending))
                         if not self.stopping.is_set():
                             self.bus.cancelled.clear()
                     self.emit("idle")

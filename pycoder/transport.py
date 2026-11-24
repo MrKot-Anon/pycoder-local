@@ -23,6 +23,10 @@ class ModelError(RuntimeError):
         self.retry_after = retry_after
 
 
+class ProtocolError(ModelError):
+    """A completed response that violates the Chat Completions tool protocol."""
+
+
 def retry_after_seconds(value, default):
     if isinstance(value, str):
         if value.strip().isdigit():
@@ -66,7 +70,7 @@ def object_value(value, field, *, nullable=False):
     if value is None and nullable:
         return {}
     if not isinstance(value, dict):
-        raise ModelError(f"Invalid model response: {field} must be an object, got {type(value).__name__}")
+        raise ProtocolError(f"Invalid model response: {field} must be an object, got {type(value).__name__}")
     return value
 
 
@@ -74,7 +78,7 @@ def array_value(value, field):
     if value is None:
         return []
     if not isinstance(value, list):
-        raise ModelError(f"Invalid model response: {field} must be an array or null, got {type(value).__name__}")
+        raise ProtocolError(f"Invalid model response: {field} must be an array or null, got {type(value).__name__}")
     return value
 
 
@@ -82,7 +86,7 @@ def text_value(value, field):
     if value is None:
         return ""
     if not isinstance(value, str):
-        raise ModelError(f"Invalid model response: {field} must be a string or null, got {type(value).__name__}")
+        raise ProtocolError(f"Invalid model response: {field} must be a string or null, got {type(value).__name__}")
     return value
 
 
@@ -543,7 +547,7 @@ class Client:
                 return models
             choices = array_value(result.get("choices"), "choices")
             if not choices:
-                raise ModelError("Invalid model response: no completion choices")
+                raise ProtocolError("Invalid model response: no completion choices")
             choice = object_value(choices[0], "choices[0]")
             message = self._message(choice["message"])
             self._attempt_received = True
@@ -578,7 +582,7 @@ class Client:
                 f"connect_timeout={self.config.timeout_seconds}s; generation_idle_timeout={self.config.generation_timeout_seconds}s",
                 retryable=True) from None
         except (ValueError, KeyError, TypeError, IndexError, AttributeError) as error:
-            raise ModelError(f"Invalid model response: {type(error).__name__}") from None
+            raise ProtocolError(f"Invalid model response: {type(error).__name__}") from None
         finally:
             if response is not None:
                 response.close()
@@ -605,10 +609,12 @@ class Client:
     def _validate(message, finish, usage=None):
         finish = text_value(finish, "finish_reason")
         if finish not in {"stop", "tool_calls", "length"}:
-            raise ModelError(f"Incomplete or unsupported response finish_reason: {finish!r}")
+            raise ProtocolError(f"Incomplete or unsupported response finish_reason: {finish!r}")
         calls = message.get("tool_calls", [])
         if finish == "length":
             raise TruncatedTool(message) if calls else OutputLimit(message)
+        if finish == "tool_calls" and not calls and "<invoke" not in (message.get("content") or ""):
+            raise ProtocolError("Invalid model response: finish_reason=tool_calls without tool_calls")
         ids = set()
         for call in calls:
             call = object_value(call, "tool_calls[]")
@@ -617,7 +623,7 @@ class Client:
             name = text_value(function.get("name"), "tool_calls[].function.name")
             if (call.get("type") != "function" or not call_id or call_id in ids
                     or not name or not isinstance(function.get("arguments"), str)):
-                raise ModelError("Malformed or duplicate tool call")
+                raise ProtocolError("Malformed or duplicate tool call")
             ids.add(call["id"])
         if not calls and not (message.get("content") or "").strip():
             raise EmptyResponse(finish, len(message.get("reasoning_content") or ""), usage or {})
@@ -659,7 +665,7 @@ class Client:
                     fragment = object_value(fragment, "delta.tool_calls[]")
                     index = fragment.get("index")
                     if type(index) is not int or index < 0:
-                        raise ModelError("Invalid model response: tool call index must be a nonnegative integer")
+                        raise ProtocolError("Invalid model response: tool call index must be a nonnegative integer")
                     call = calls.setdefault(index, {"id": "", "type": "function",
                                                     "function": {"name": "", "arguments": ""}})
                     call["id"] += text_value(fragment.get("id"), "tool call id")

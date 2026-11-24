@@ -6,18 +6,104 @@ adaptive retained-user budget, explicit no-progress and step limits.
 """
 
 import json
+import re
 import threading
 import uuid
 
 from .history import groups, repair_pending
 from .prompts import COMPACT, SUMMARY_PREFIX, SYSTEM
 from .tools import TOOL_SPECS
-from .transport import ModelError, OutputLimit
+from .transport import ModelError, OutputLimit, ProtocolError
 from .util import tokens, truncate
 from .events import Cancelled
 from .plans import has_open_steps, FINAL_PLAN_CHECK
 from .scheduler import execute_batches
 from .platform_support import environment_description
+
+FINAL_MARKER = "[[PYCODER_DONE]]"
+INVOKE_START = re.compile(r"<invoke\s+name\s*=\s*(['\"])([^'\"]+)\1\s*>")
+PARAMETER_START = re.compile(r"<parameter\s+name\s*=\s*(['\"])([^'\"]+)\1\s*>")
+
+
+def recover_text_tool_call(message):
+    if message.get("tool_calls"):
+        return message
+    content = message.get("content") or ""
+    if content.rstrip().endswith(FINAL_MARKER):
+        return message
+    closing = "</minimax:tool_call>"
+    opener = "<minimax:tool_call>"
+    invokes = list(INVOKE_START.finditer(content))
+    if not invokes and opener not in content and closing not in content:
+        return message
+    start = content.rfind(opener)
+    if start >= 0:
+        prefix = content[:start].rstrip()
+        start += len(opener)
+    else:
+        start = invokes[0].start() if invokes else -1
+        if start >= 0 and content[:start] and not content[:start].endswith("\n"):
+            return message
+        if start >= 0 and content[:start].count("```") % 2:
+            return message
+        prefix = content[:start].rstrip() if start >= 0 else ""
+    if start < 0:
+        raise ProtocolError("Model emitted a Minimax tool-call marker without an invoke block")
+    block = content[start:].strip()
+    if block.endswith(closing):
+        block = block[:-len(closing)].rstrip()
+    if not block.endswith("</invoke>"):
+        raise ProtocolError("Model emitted an incomplete textual Minimax tool call")
+    calls = []
+    position = 0
+    while position < len(block):
+        invoke = INVOKE_START.match(block, position)
+        if invoke is None:
+            raise ProtocolError("Model emitted a malformed textual Minimax tool call")
+        name = invoke.group(2)
+        position = invoke.end()
+        spec = next((item["function"] for item in TOOL_SPECS if item["function"]["name"] == name), None)
+        if spec is None:
+            raise ProtocolError(f"Model emitted an unknown textual Minimax tool call: {name}")
+        arguments = {}
+        while True:
+            while position < len(block) and block[position].isspace():
+                position += 1
+            if block.startswith("</invoke>", position):
+                position += len("</invoke>")
+                break
+            parameter = PARAMETER_START.match(block, position)
+            if parameter is None:
+                raise ProtocolError("Model emitted a malformed textual Minimax tool call")
+            key = parameter.group(2)
+            position = parameter.end()
+            end = block.find("</parameter>", position)
+            if end < 0:
+                end = block.find("</invoke>", position)
+                if end < 0:
+                    raise ProtocolError("Model emitted invalid textual Minimax tool parameters")
+                next_position = end
+            else:
+                next_position = end + len("</parameter>")
+            if key in arguments or key not in spec["parameters"]["properties"]:
+                raise ProtocolError("Model emitted invalid textual Minimax tool parameters")
+            value = block[position:end]
+            position = next_position
+            if spec["parameters"]["properties"][key]["type"] != "string":
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    raise ProtocolError("Model emitted invalid JSON in a textual Minimax tool parameter") from None
+            arguments[key] = value
+        if set(spec["parameters"]["required"]) - set(arguments):
+            raise ProtocolError("Model omitted a required textual Minimax tool parameter")
+        calls.append({"id": "text_" + uuid.uuid4().hex, "type": "function", "function": {
+            "name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}})
+        while position < len(block) and block[position].isspace():
+            position += 1
+    if not calls:
+        raise ProtocolError("Model emitted a Minimax tool-call marker without an invoke block")
+    return {**message, "content": prefix or None, "tool_calls": calls}
 
 
 class Agent:
@@ -53,7 +139,7 @@ class Agent:
     def messages(self):
         return [{"role": "system", "content": self.effective_system()}] + self.history.messages
 
-    def effective_system(self):
+    def effective_system(self, *, finalization=True):
         from .sandbox import supported
         cfg = self.tools.sandbox_config()
         sandboxed = cfg.sandbox_enabled and supported()
@@ -64,6 +150,11 @@ class Agent:
                          proxy_enabled=cfg.proxy_enabled, allow_localhost=cfg.sandbox_localhost,
                          allow_lan=cfg.sandbox_lan)
         prompt = self.system + "\nCurrent shell sandbox settings (for new processes): " + json.dumps(state, ensure_ascii=False)
+        if finalization and self.config.require_explicit_finish:
+            prompt += ("\nWhen the user's task is actually complete, end your final answer with " + FINAL_MARKER + ". "
+                       "Do not use this marker in progress messages or while any requested work remains. "
+                       "For tool use, issue a real tool call. If your provider emits MiniMax XML, include the complete "
+                       "<minimax:tool_call>...</minimax:tool_call> block.")
         if cfg.full_access:
             prompt += ("\nThe user explicitly enabled FULL ACCESS. This overrides ordinary command/escalation/network approval instructions above. "
                        "Commands run without an OS sandbox or approval prompts, with the user's OS permissions, including outside the workspace. "
@@ -84,7 +175,7 @@ class Agent:
         source = groups(self.history.messages)
         summary_budget = min(self.config.max_output_tokens, max(512, self.threshold() // 4))
         request_limit = self.config.context_window * 95 // 100 - summary_budget
-        base = [{"role": "system", "content": self.effective_system()}]
+        base = [{"role": "system", "content": self.effective_system(finalization=False)}]
         suffix = [{"role": "user", "content": COMPACT}]
         # Trim only a working copy, never the durable original history on failure.
         while True:
@@ -188,12 +279,15 @@ class Agent:
         failed_repeats, previous_failure = 0, None
         final_plan_checked = False
         overflow_recovered = False
+        protocol_failures = 0
+        unfinished_replies = 0
         try:
             for step in range(self.config.max_steps):
                 self.check_cancelled()
                 self.receive(self.incoming())
                 if self.estimate() >= self.threshold():
                     self.compact()
+                self.receive(self.incoming())
                 try:
                     self.event("model_start", step=step + 1)
                     result = self.client.complete(self.messages(), self.specs, self.on_text)
@@ -221,6 +315,17 @@ class Agent:
                         raise
                     self.event("model_restart")
                     continue
+                except ProtocolError as error:
+                    protocol_failures += 1
+                    if protocol_failures >= 3:
+                        raise ModelError(f"Model response violated the tool protocol three times: {error}. Session saved; use /continue.") from error
+                    self.history.append({"role": "user", "content":
+                        "Your previous response had invalid tool-call syntax. No tool from that response was executed. "
+                        f"Error: {error}. Reissue the intended action as a complete, valid tool call. "
+                        "For MiniMax XML include both opening and closing minimax:tool_call tags. "
+                        "Do not repeat actions already recorded as completed in tool results."})
+                    self.event("model_restart")
+                    continue
                 except ModelError as error:
                     if error.context_overflow and not overflow_recovered:
                         self.compact()
@@ -230,14 +335,40 @@ class Agent:
                 overflow_recovered = False
                 self.check_cancelled()
                 self.event("model_end")
-                self.history.append(result.message)
+                try:
+                    message = recover_text_tool_call(result.message)
+                except ProtocolError as error:
+                    protocol_failures += 1
+                    if protocol_failures >= 3:
+                        raise ModelError(f"Model response violated the tool protocol three times: {error}. Session saved; use /continue.") from error
+                    self.history.append(result.message)
+                    self.history.append({"role": "user", "content":
+                        "Your previous response had invalid tool-call syntax. No tool from that response was executed. "
+                        f"Error: {error}. Reissue the intended action as a complete, valid tool call. "
+                        "For MiniMax XML include both opening and closing minimax:tool_call tags. "
+                        "Do not repeat actions already recorded as completed in tool results."})
+                    self.event("model_restart")
+                    continue
+                protocol_failures = 0
+                self.history.append(message)
                 self.observed_estimate = tokens(self.system) + tokens(self.specs) + self.history.estimate() + 64
                 self.observed_tokens = int(result.usage.get("total_tokens") or (
                     (result.usage.get("prompt_tokens") or 0) + (result.usage.get("completion_tokens") or 0)))
-                calls = result.message.get("tool_calls", [])
+                calls = message.get("tool_calls", [])
                 self.event("context", used=self.estimate(), window=self.config.context_window)
                 if not calls:
                     if self.receive(self.before_finish()):
+                        continue
+                    content = message.get("content") or ""
+                    if self.config.require_explicit_finish and not content.rstrip().endswith(FINAL_MARKER):
+                        unfinished_replies += 1
+                        if unfinished_replies >= 3:
+                            raise ModelError("Model stopped three times without an explicit final marker. Session saved; use /continue.")
+                        self.history.append({"role": "user", "content":
+                            "Your previous message did not explicitly finish the task. Continue the pending work with tool calls. "
+                            "If the task is truly complete, give the final answer and end it with " + FINAL_MARKER + ". "
+                            "Do not treat a running command or a promise to wait as completion."})
+                        self.event("model_restart")
                         continue
                     if has_open_steps(self.history.plan):
                         if not final_plan_checked:
@@ -250,7 +381,10 @@ class Agent:
                         # must remain visibly unfinished, not loop until fake success.
                         self.event("plan_unfinished")
                         self.emit("В плане остались незавершённые пункты; автоматические отметки не выставлены.")
-                    return result.message.get("content", "")
+                        if self.config.require_explicit_finish:
+                            raise ModelError("Model claimed completion while plan steps remain open. Session saved; use /continue.")
+                    return content.rstrip().removesuffix(FINAL_MARKER).rstrip() if self.config.require_explicit_finish else content
+                unfinished_replies = 0
                 outcomes = []
                 for call, output in execute_batches(calls, self.execute_call, self.config.parallel_tools):
                     self.history.append({"role": "tool", "tool_call_id": call["id"], "content": output})
